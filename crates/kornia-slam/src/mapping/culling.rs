@@ -16,9 +16,8 @@ const MIN_FOUND_RATIO: f64 = 0.20;
 
 /// Ids of the landmarks that fail the culling policy.
 ///
-/// Two criteria, as before: a poor found ratio once a landmark has been seen
-/// enough times to judge, and any landmark sitting behind a keyframe that
-/// observes it.
+/// Two criteria: a poor found ratio once a landmark has been seen
+/// enough times to judge, and a landmark sitting behind its reference keyframe.
 fn select_for_culling(map: &Map) -> Vec<usize> {
     let mut selected: HashSet<usize> = HashSet::new();
 
@@ -28,18 +27,16 @@ fn select_for_culling(map: &Map) -> Vec<usize> {
         }
         if mp.found_ratio() < MIN_FOUND_RATIO {
             selected.insert(idx);
+            continue;
         }
-    }
 
-    for kf in map.keyframes() {
-        for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
-            if let Some(mp) = map.map_points().get(*mp_idx)
-                && !mp.culled
-            {
-                let p_cam = kf.frame.pose_world_to_cam.transform_point(&mp.position);
-                if p_cam.z <= 1e-8 {
-                    selected.insert(*mp_idx);
-                }
+        // Behind-camera check: ONLY the reference keyframe (ORB-SLAM3 behavior).
+        // A point observed by multiple keyframes should not be culled just because
+        // it's behind the camera in a non-reference view.
+        if let Some(ref_kf) = map.get_keyframe(mp.keyframe_idx) {
+            let p_cam = ref_kf.frame.pose_world_to_cam.transform_point(&mp.position);
+            if p_cam.z <= 1e-8 {
+                selected.insert(idx);
             }
         }
     }
@@ -68,7 +65,7 @@ mod tests {
     use crate::frame::Frame;
     use crate::mapping::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
     use kornia_3d::pose::Pose3d;
-    use kornia_algebra::Vec3F64;
+    use kornia_algebra::{SO3F64, Vec3F64};
     use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
 
@@ -142,5 +139,55 @@ mod tests {
 
         assert_eq!(cull_landmarks(&mut map), 0);
         assert!(!map.map_points()[idx].culled);
+    }
+
+    /// Regression test for bug where a landmark observed by multiple keyframes
+    /// was incorrectly culled if it was behind the camera in ANY keyframe,
+    /// instead of only checking the reference keyframe (mp.keyframe_idx).
+    ///
+    /// A landmark with reference KF0 at z=5.0 (in front) but also observed by
+    /// KF1 rotated 180° (point now behind) should NOT be culled.
+    #[test]
+    fn behind_camera_culling_only_checks_reference_keyframe() {
+        let mut map = Map::new();
+
+        // Reference keyframe (idx=0) - identity pose, point at z=5 is IN FRONT
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])))
+            .unwrap();
+
+        // Create landmark referenced to KF0
+        let mp_idx = map
+            .insert_landmark(LandmarkSeed {
+                position: Vec3F64::new(0.0, 0.0, 5.0),
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: 0,
+                },
+            })
+            .unwrap();
+
+        // Second keyframe (idx=1) - rotated 180° around Y, point is now BEHIND
+        map.insert_keyframe(Keyframe::from_frame(test_frame(1, vec![[0u8; 32]])))
+            .unwrap();
+        let rotated_rot = SO3F64::exp(Vec3F64::new(0.0, std::f64::consts::PI, 0.0)).matrix();
+        let rotated_pose = Pose3d::new(rotated_rot, Vec3F64::ZERO);
+        map.set_keyframe_pose_for_test(1, rotated_pose);
+
+        // Link the landmark to KF1 as well (multi-keyframe observation)
+        map.link_observation(1, 0, mp_idx).unwrap();
+
+        // Point has good tracking stats (10 visible, 8 found = 80% ratio)
+        map.set_tracking_stats_for_test(mp_idx, 10, 8);
+
+        // BUG: Before fix, this would cull the landmark because it's behind KF1
+        // FIX: Should NOT cull because reference keyframe (KF0) has point in front
+        let culled = cull_landmarks(&mut map);
+
+        assert_eq!(
+            culled, 0,
+            "Should NOT cull - reference keyframe (0) has point in front"
+        );
+        assert!(!map.map_points()[mp_idx].culled);
     }
 }
