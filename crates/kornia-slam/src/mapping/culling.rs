@@ -33,9 +33,10 @@ fn select_for_culling(map: &Map) -> Vec<usize> {
         }
 
         // Criterion 2: Landmark sitting behind its reference keyframe.
-        // A landmark's scale geometry and initial coordinate frame are anchored to its reference keyframe.
-        // Checking depth relative to its reference keyframe prevents over-culling points that are valid in
-        // front of other keyframes as the camera moves past them or during local pose adjustments.
+        // A landmark's scale geometry and initial coordinate frame are anchored
+        // to its reference keyframe. Checking depth relative to its reference
+        // keyframe prevents over-culling points that are valid in front of other
+        // keyframes as the camera moves past them or during local pose adjustments.
         if let Some(ref_kf) = map.get_keyframe(mp.keyframe_idx) {
             let p_cam = ref_kf.frame.pose_world_to_cam.transform_point(&mp.position);
             if p_cam.z <= 1e-8 {
@@ -68,7 +69,7 @@ mod tests {
     use crate::frame::Frame;
     use crate::mapping::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
     use kornia_3d::pose::Pose3d;
-    use kornia_algebra::Vec3F64;
+    use kornia_algebra::{Mat3F64, Vec3F64};
     use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
 
@@ -165,7 +166,7 @@ mod tests {
         // KF1 at (0,0,10) facing +Z (so point at Z=5 is behind KF1 at Z_cam = -5)
         let mut kf1_frame = test_frame(1, vec![[0u8; 32]]);
         kf1_frame.pose_world_to_cam =
-            Pose3d::new(kornia_algebra::Mat3F64::IDENTITY, Vec3F64::new(0.0, 0.0, -10.0));
+            Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.0, 0.0, -10.0));
         map.insert_keyframe(Keyframe::from_frame(kf1_frame))
             .unwrap();
         map.link_observation(1, 0, idx).unwrap();
