@@ -34,6 +34,49 @@ keypoints, and a follow view.</sub>
 
 See [ROADMAP.md](ROADMAP.md) for what's next.
 
+## Install
+
+### Prebuilt binaries (v0.1.0)
+
+Linux x86_64 and aarch64 builds need glibc 2.35+ (Ubuntu 22.04+, Jetson JetPack 6):
+
+```bash
+TARGET=x86_64-unknown-linux-gnu   # or aarch64-unknown-linux-gnu
+NAME=kornia-slam-v0.1.0-$TARGET
+curl -L --remote-name-all https://github.com/kornia/kornia-slam/releases/download/v0.1.0/$NAME.tar.gz{,.sha256}
+sha256sum -c $NAME.tar.gz.sha256
+tar -xzf $NAME.tar.gz
+
+# stereo + IMU on an EuRoC sequence, with evaluation against ground truth
+./$NAME/kornia-slam euroc --data /path/to/MH_01_easy --stereo --imu --evaluate
+```
+
+The archive holds the binary, `README.md`, `CHANGELOG.md` and `LICENSE`.
+
+The v0.1.0 binary predates run files: it takes a source subcommand and flags
+(`kornia-slam --help`, `kornia-slam euroc --help`) rather than the `--config`
+run files described below. Global options go before the subcommand, e.g. loop
+closing with the vocabulary from [Quick start](#quick-start):
+`kornia-slam --vocab /path/to/ORBvoc.txt --apply-pgo euroc …`.
+
+It is built with the default features: Rerun streaming (`--rerun-stream`, which
+needs the `rerun` 0.29.2 viewer on `PATH`, e.g. `pip install rerun-sdk==0.29.2`)
+is in, live OAK-D and UVC cameras are not. Build from source with
+`--features oakd` or `--features uvc` for those; OAK-D has extra prerequisites,
+see [apps/kornia-slam-app](apps/kornia-slam-app/README.md#oak-d-camera).
+
+### From source
+
+The app needs Rust 1.91+ (the libraries 1.89+). Build and run with Cargo as in
+[Quick start](#quick-start), or with [Pixi](https://pixi.sh), which provides the
+toolchain:
+
+```bash
+pixi run rust-run -- --config configs/euroc.ron
+pixi run rust-lint
+pixi run rust-test
+```
+
 ## Quick start
 
 Download a [EuRoC](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets)
