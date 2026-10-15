@@ -138,7 +138,11 @@ positive definite; `run_local_inertial_ba` drops such a factor
 **Breaking:** `run_local_inertial_ba` takes a `wheel_factors` slice (indexed
 by `Frame::idx`) and `visual_inertial_bundle_adjust` a `wheel_edges` slice
 (indexed by keyframe slot); pass `&[]` to keep the old behaviour. `ViBaError`
-gains three variants. The workspace version moves to 0.2.0.
+gains five variants (`WheelFactorOutOfRange`, `InvalidWheelCovariance`,
+`NonFiniteWheelFactor`, `WheelFactorSelfLoop`, `InvalidWheelHuber`): a factor
+that links a keyframe to itself, or whose Huber threshold or out-of-plane
+sigma is not finite and positive, is refused too. The workspace version moves
+to 0.2.0.
 
 **Stationary edges for parked robots.** Two keyframes of one stop can now be
 linked without IMU preintegration. `mapping::stationary::StationaryFactor`
@@ -184,6 +188,105 @@ edge) and `KeyframeRemovalError` the variant `InvalidStillNeighbour`. Additive:
 (the report is `#[non_exhaustive]`), and `kornia_sensors::imu::ImuCalib`
 derives `PartialEq`. All of this rides on the already-breaking 0.2.0; none of
 it belongs in a 0.1.x.
+
+**A parked window no longer turns a keyframe.** A landmark seen from one
+place has no observable depth, and a parked window sees every landmark from
+one place. VI-BA inverted each landmark's 3×3 block undamped, so the point
+step could fling such a landmark millions of metres out along its ray (or
+behind the camera), and the result was written back to the map. When a later
+keyframe measured that landmark by stereo, its depth residual was ~1e8 sigma,
+and the cheapest way the solver found to lower it was to turn a keyframe by
+~90°; downstream this was a VIO pose refused as an 80° jump after hours
+parked. Four guards, each with a regression test (the end-to-end one turns a
+keyframe by 137° with them reverted):
+- the landmark blocks are Marquardt-damped like the keyframe system. This
+  bounds the point step (undamped, a parked chain flung landmarks ~1e7 times
+  their depth) but does not make the depth observable: over many parked
+  windows a depth-free landmark still drifts out along its ray, to tens or
+  hundreds of times its depth. The depth gate below is what keeps a landmark
+  that got far from turning a keyframe when stereo next measures it;
+- a stereo depth row is left out of the solve when, at the start, the
+  landmark's depth in that camera is outside `(0, 10·d + 1 m)` for measured
+  depth `d` (`ViBaParams::depth_gate_factor`, default 10; NaN, zero and
+  negative values are refused with `ViBaError::InvalidDepthGateFactor`,
+  `f64::INFINITY` keeps only the behind-the-camera check). A free landmark
+  whose every depth row lies beyond that bound is first moved along the ray
+  of its best measured observation to the measured depth, and its rows then
+  enter the solve: reprojection rows constrain only its bearing, so a gated
+  landmark would otherwise stay wrong (and gated) in every later window,
+  including the moving ones after the robot drives off. The move needs
+  corroboration, so a one-off bad stereo match cannot pull a correct landmark
+  onto itself: a second gated depth row that agrees with the moved position
+  within three combined sigmas, or a starting depth more than 100 times the
+  gate's bound (the ~1e7 m flings). Otherwise the rows are only gated. The
+  second row is not required to come from a different viewpoint, so a
+  mismatch that repeats in every frame of a parked window (repetitive
+  texture, a reflection) corroborates itself and still moves the landmark,
+  as it did before corroboration was required;
+- a step may not move a landmark from in front of an observing camera to
+  behind it: a free landmark whose own step does that keeps its old position
+  for that step, and a step whose camera motion does it is refused (λ grows)
+  unless every observation that flips is a Huber outlier, so one mismatched
+  near-plane association cannot stall a moving window;
+- `run_local_inertial_ba` does not write back a landmark the solve left behind
+  any observer, or whose distance from its nearest observer grew more than
+  tenfold and beyond 50 m; it keeps its old position. This catches a fling
+  in one solve, not a slow drift (each window may grow a landmark almost
+  tenfold). `cull_landmarks` also retires a landmark farther than 10 km from
+  every keyframe observing it (it already retired one behind an observer).
+
+The solve now reports what it did: `ViBaResult` gains `initial_cost`,
+`depth_rows_gated`, `points_reseeded`, `cheirality_rejections` and
+`cheirality_points_held`, and
+the update
+`run_local_inertial_ba` returns carries them, with the write-back guard's
+count, in `BaUpdate::solve_stats` (`LocalBaStats`; `None` from the visual
+solvers).
+
+**The stereo depth row's pose Jacobian is right for a rotated camera.** Its
+translation part was `(0, 0, 1/σ)`, which holds only when the camera's
+rotation is the identity; under the solver's right perturbation it is row 2
+of the rotation, `(r20, r21, r22)/σ`, as the reprojection rows and the
+depth row's own point Jacobian already had. With the wrong column, every
+rotated keyframe's Gauss-Newton step from a stereo depth row pushed its
+translation along the wrong axis. A numeric-differentiation test pins it.
+Expect small changes in VI-BA results on stereo-inertial data.
+
+**Huber costs match their weights.** Every robustified VI-BA term (reprojection,
+stereo depth, IMU navigation block, wheel, stationary) weighted its normal
+equations by Huber's `w = min(1, √(k/s))` but scored the LM step with
+`½·w·s`, which for an outlier is `½√(k s)`: not the objective `w` is the
+derivative of, so steps were accepted and refused on the wrong numbers. The
+cost is now Huber's `½ρ(s)` (`s` inside the threshold, `2√(k s) − k` past it),
+whose gradient is the weighted one; tests check the numeric derivative of the
+shared Huber objective, and of the IMU, wheel and stationary costs, against
+their normal equations. Inlier costs are unchanged; outlier costs
+are higher, so reported costs are not comparable with earlier builds.
+
+**Stationary initialization refuses inputs that gave a NaN state.** A
+non-finite or negative `max_gravity_norm_error` is refused
+(`StationaryInitError::InvalidTolerance`), so is a zero specific force (an
+infinite tolerance let it through to a division by zero) and a non-finite mean
+gyro rate (`StationaryInitError::NonFiniteGyro`).
+
+**Breaking (all within 0.2.0):** `ViBaParams` gains `depth_gate_factor`, so a
+struct literal needs `..ViBaParams::default()`. `ViBaResult` is
+`#[non_exhaustive]`. As the 0.2.0 notes promise, the new public types are
+`#[non_exhaustive]` too, each with a constructor: `WheelOdomMeasurement`
+(`new`, `with_out_of_plane_sigmas`), `WheelOdomFactor` (`new`),
+`StationaryFactor` (`new`, `with_gyro`), `StationaryGyro` (`new`),
+`KeyframeEvidence` (`new`, `with_median_parallax_px`, `Default`),
+`KeyframeCullingConfig` (`Default`) and
+`StillNeighbour` (`new`). Code outside the crate can no longer build them with
+a struct literal (functional update `..Default::default()` included); it
+starts from the constructor and sets the public fields
+(`tests/non_exhaustive_api.rs` builds each one that way). `StillSide`, a
+two-valued enum, stays exhaustive.
+
+**`merge_imu_edges = false` keeps stationary boundaries.** Culling removed a
+keyframe at the boundary between a stationary and an IMU edge, moving its IMU
+edge onto the still neighbour, even with `merge_imu_edges` off; it now keeps
+it (counted in `kept_for_edges`).
 
 **The IMU buffer stays bounded while bootstrap fails.** `SlamSystem` dropped
 buffered IMU samples only once a map existed or a monocular bootstrap

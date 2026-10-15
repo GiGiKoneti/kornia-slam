@@ -51,9 +51,45 @@ pub struct BaUpdate {
     pub(crate) map_points: Vec<Vec3F64>,
     pub(crate) imu_preintegrations: Vec<PreintegratedImu>,
     pub(crate) snapshot: BaSnapshot,
+    pub(crate) solve_stats: Option<LocalBaStats>,
+}
+
+/// What a local solve did, for the caller to log; set by
+/// `mapping::bundle_adjustment::run_local_inertial_ba` when its solver ran.
+/// `#[non_exhaustive]`, so a figure can be added without a semver break.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[non_exhaustive]
+pub struct LocalBaStats {
+    /// Robust cost at the starting state.
+    pub initial_cost: f64,
+    /// Robust cost after the last accepted step (`f64::MAX` if none was).
+    pub final_cost: f64,
+    pub iterations: usize,
+    pub converged: bool,
+    /// Stereo depth rows left out of the solve because the landmark's depth
+    /// in that camera disagreed with the measurement at the start.
+    pub depth_rows_gated: usize,
+    /// Landmarks moved back along their ray to the stereo depth before the
+    /// solve, because every depth row on them was beyond the depth gate.
+    pub points_reseeded: usize,
+    /// LM steps refused because their camera motion moved a landmark behind
+    /// a camera whose observation of it is a Huber inlier.
+    pub cheirality_rejections: usize,
+    /// Landmark steps held back because they would have moved the landmark
+    /// behind an observing camera.
+    pub cheirality_points_held: usize,
+    /// Landmarks whose optimized position was not written back: behind an
+    /// observing keyframe, or flung far from every observer.
+    pub points_rejected: usize,
 }
 
 impl BaUpdate {
+    /// What the solve that produced this update did, if one ran and reports
+    /// it (see [`LocalBaStats`]).
+    pub fn solve_stats(&self) -> Option<&LocalBaStats> {
+        self.solve_stats.as_ref()
+    }
+
     /// The IMU bias this update would write on each captured keyframe, in capture order
     /// (fixed context keyframes included, unchanged).
     ///
@@ -110,6 +146,7 @@ impl BaSnapshot {
                 .map(|factor| factor.preintegrated.clone())
                 .collect(),
             snapshot: self,
+            solve_stats: None,
         }
     }
 }

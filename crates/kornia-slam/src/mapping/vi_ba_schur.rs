@@ -38,14 +38,39 @@
 //! Supports Huber-robustified reprojection, stereo depth, IMU, wheel
 //! odometry and stationary residuals, an accel-bias prior, fixed keyframes
 //! and fixed points.
-//! A damped step is kept only if it lowers the cost; otherwise λ grows and the
-//! step is retried.
+//! A damped step is kept only if it lowers the cost; otherwise λ grows and
+//! the step is retried. A step must also keep landmarks in front of the
+//! cameras that observe them: a free landmark whose own step would cross an
+//! observing camera's image plane keeps its old position for that step, and
+//! a step whose camera motion still puts a landmark behind a camera is
+//! refused, unless every observation that flips is a Huber outlier (a
+//! mismatched association, whose pull the robust cost already bounds).
+//!
+//! A landmark seen from (nearly) one viewpoint, as every landmark of a parked
+//! window is, has an unobservable depth: its C block is rank 2, or nearly so.
+//! C is therefore Marquardt-damped like the keyframe system. That keeps the
+//! point step finite (undamped, a parked window flung such a landmark ~1e7 m
+//! along its ray), but it does not make the depth observable: over a chain of
+//! parked windows a depth-free landmark still walks out along its ray with the
+//! tracking noise, to tens or hundreds of times its depth. What keeps a
+//! landmark that got far from turning a keyframe is the depth gate: a stereo
+//! depth row whose landmark is far from the measured depth at the start is
+//! left out of the solve ([`ViBaParams::depth_gate_factor`]), and a free
+//! landmark that every depth row disagrees with that way is first moved back
+//! along its ray to the measured depth, so the gate does not leave it wrong
+//! for good. Without the gate, a
+//! flung landmark made
+//! the next window's depth row a residual of ~1e8 sigma, which the solver
+//! lowered by turning a keyframe by ~90°. `run_local_inertial_ba` also refuses
+//! to write back a landmark one solve moved more than tenfold and beyond 50 m,
+//! which catches a fling but not a slow walk.
 
 use faer::Mat;
 use faer::prelude::Solve;
 use kornia_algebra::{Mat3F64, SE3F32, SO3F64, Vec3F64};
 use thiserror::Error;
 
+use crate::mapping::robust::huber_weight_and_cost;
 use crate::mapping::stationary::{
     self, StationaryFactor, StationaryInfo, StationaryResidual, StationaryState,
 };
@@ -55,10 +80,28 @@ use crate::pose_conversion::{pose_to_se3, se3_to_pose, vec3_to_f32};
 use kornia_3d::ba::{BaError, BaObservation};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_3d::ransac::{HuberKernel, RobustKernel};
 use kornia_sensors::imu::{ImuBias, PreintegratedImu};
 
 const MIN_Z: f32 = 1e-3;
+
+/// Floor under a diagonal entry before Marquardt damping scales it, so a DOF
+/// with no curvature at all is still damped.
+const MIN_DAMPING_FLOOR: f64 = 1e-6;
+
+/// Metres added to the depth gate's upper bound, so a near measurement is not
+/// gated by the noise of a small depth (see [`ViBaParams::depth_gate_factor`]).
+const DEPTH_GATE_MARGIN_M: f64 = 1.0;
+
+/// A landmark whose starting depth exceeds this many times the depth gate's
+/// bound is re-seeded on a single depth row: no plausible scene puts it
+/// there, so the measurement is the better guess (the ~1e7 m landmarks a
+/// parked window flung). Nearer than that, a single row may be the bad one,
+/// and a re-seed needs a second row that agrees.
+const RESEED_UNCORROBORATED_FACTOR: f64 = 100.0;
+
+/// Sigmas within which a second depth row must agree with a re-seed. The
+/// row may come from the same viewpoint (see [`reseed_walked_landmarks`]).
+const RESEED_AGREEMENT_SIGMAS: f64 = 3.0;
 
 /// Errors specific to VI-BA.
 #[derive(Debug, Error)]
@@ -75,10 +118,16 @@ pub enum ViBaError {
     InvalidWheelCovariance(usize),
     #[error("Wheel odometry edge {0} has a non-finite delta or extrinsic")]
     NonFiniteWheelFactor(usize),
+    #[error("Wheel odometry edge {0} links a keyframe to itself")]
+    WheelFactorSelfLoop(usize),
+    #[error("Wheel odometry edge {0} has a Huber threshold that is not finite and positive")]
+    InvalidWheelHuber(usize),
     #[error("Stationary edge keyframe indices out of range: {0} → {1}")]
     StationaryFactorOutOfRange(usize, usize),
     #[error("Stationary edge {0} is invalid (see StationaryFactor::is_valid)")]
     InvalidStationaryFactor(usize),
+    #[error("depth_gate_factor {0} is not positive (NaN, zero and negative are refused)")]
+    InvalidDepthGateFactor(f64),
     #[error(transparent)]
     Ba(#[from] BaError),
 }
@@ -163,6 +212,28 @@ pub struct ViBaParams {
     /// leftover gravity error and will explain it away as bias — set to 0.0
     /// to disable and reproduce the old behaviour.
     pub accel_bias_prior_weight: f64,
+    /// Stereo depth gate. An observation's depth row (measured depth `d`) is
+    /// left out of the whole solve when, at the starting state, the
+    /// landmark's depth `z` in that camera is outside
+    /// `(0, depth_gate_factor · d + 1 m)`. Such a landmark's position is
+    /// wrong, not the measurement (a landmark whose depth a parked window
+    /// could not observe), and its depth residual can be ~1e8 sigma: enough
+    /// that the cheapest way to lower it is to rotate the camera until the
+    /// landmark leaves the view. The reprojection rows stay in. A free
+    /// landmark whose every depth row is beyond the bound (in front of the
+    /// camera) is first moved along its best measured ray to that depth, and
+    /// its rows then enter the solve: gated, nothing else would ever restore
+    /// its depth. That move needs corroboration: a second gated depth row
+    /// that agrees with the re-seeded position, or a starting depth beyond
+    /// 100 times the gate bound; otherwise the rows are only gated, so a
+    /// one-off bad stereo match cannot pull a correct landmark onto itself.
+    /// The second row need not come from another viewpoint: a mismatch
+    /// repeated in every frame of a parked window corroborates itself and
+    /// the landmark still moves. Default
+    /// 10; `f64::INFINITY` gates only landmarks behind the camera. Must be
+    /// positive: NaN, zero or a negative value is refused
+    /// ([`ViBaError::InvalidDepthGateFactor`]).
+    pub depth_gate_factor: f64,
 }
 
 impl Default for ViBaParams {
@@ -186,18 +257,258 @@ impl Default for ViBaParams {
             // (those edges carry ~1e9 information when nav residuals are
             // healthy, per the LM-damping note below).
             accel_bias_prior_weight: 1e2,
+            depth_gate_factor: 10.0,
         }
     }
 }
 
-/// Output of VI-BA.
+/// Output of VI-BA. `#[non_exhaustive]`, so a figure can be added without a
+/// semver break.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ViBaResult {
     pub keyframes: Vec<ViBaKeyframe>,
     pub points: Vec<Vec3F64>,
     pub iterations: usize,
     pub converged: bool,
+    /// Robust cost after the last accepted step; `f64::MAX` if none was.
     pub final_cost: f64,
+    /// Robust cost at the starting state (`f64::MAX` only if no iteration
+    /// ran, i.e. `max_iterations == 0`).
+    pub initial_cost: f64,
+    /// Depth rows left out by [`ViBaParams::depth_gate_factor`], counted
+    /// after the re-seed below.
+    pub depth_rows_gated: usize,
+    /// Free landmarks moved, before the solve, to the measured depth along
+    /// an observing ray because every depth row on them was beyond the depth
+    /// gate and the move was corroborated (see
+    /// [`ViBaParams::depth_gate_factor`]).
+    pub points_reseeded: usize,
+    /// Steps refused because their camera motion moved a landmark behind a
+    /// camera whose observation of it is a Huber inlier.
+    pub cheirality_rejections: usize,
+    /// Landmark steps held back (the landmark kept its position for that
+    /// step) because they would have moved it behind an observing camera.
+    pub cheirality_points_held: usize,
+}
+
+/// Upper bound of the depth gate for a measured depth `d`, metres.
+fn depth_gate_bound(d: f32, factor: f64) -> f64 {
+    factor * d as f64 + DEPTH_GATE_MARGIN_M
+}
+
+/// A gated stereo depth row: (observation index, measured depth, sigma), metres.
+type GatedDepthRow = (usize, f32, f64);
+
+/// Moves each free landmark whose stereo depth rows all lie beyond the depth
+/// gate (in front of their cameras, but farther than
+/// [`ViBaParams::depth_gate_factor`] allows) along the ray of one of those
+/// observations to its measured depth; returns how many moved. Such a landmark walked out along its ray while no
+/// window could observe its depth; reprojection rows constrain only its
+/// bearing, so without this it would stay gated, and wrong, in every later
+/// window. A landmark any depth row agrees with, or one behind a camera, is
+/// left alone.
+///
+/// A one-off erroneous stereo depth must not pull a correct far landmark
+/// onto itself, so the move needs corroboration: another gated depth row
+/// whose predicted depth at the re-seeded position is within
+/// [`RESEED_AGREEMENT_SIGMAS`] of its measurement. The gated rows are tried
+/// as the re-seed in ascending `depth_sigma` (best measured first) and the
+/// first corroborated one wins, so a bad nearest row (the smallest sigma,
+/// since sigma grows with depth) cannot veto two rows that agree. With no
+/// corroborated row the landmark moves to the best row only if its starting
+/// depth is past [`RESEED_UNCORROBORATED_FACTOR`] times that row's gate
+/// bound; otherwise it stays put and its rows are only gated.
+///
+/// The second row is not checked for geometric independence. In a parked
+/// window every keyframe sees the same image from the same pose, so a
+/// mismatch from repetitive texture or a reflection gives the same wrong
+/// depth in each of them and corroborates itself. Requiring a baseline
+/// would close that, but would also stop a parked window from ever
+/// restoring the landmarks it walked, which is the case this re-seed is for.
+fn reseed_walked_landmarks(
+    keyframes: &[ViBaKeyframe],
+    points: &mut [Vec3F64],
+    observations: &[BaObservation],
+    point_free: &[bool],
+    factor: f64,
+) -> usize {
+    // Per landmark: (any depth row in the gate or behind, gated rows).
+    let mut rows: Vec<(bool, Vec<GatedDepthRow>)> = vec![(false, Vec::new()); points.len()];
+    for (o, obs) in observations.iter().enumerate() {
+        let Some(d) = obs.depth_meas else {
+            continue;
+        };
+        let (Some(kf), Some(p)) = (keyframes.get(obs.pose_idx), points.get(obs.point_idx)) else {
+            continue;
+        };
+        let z = kf.pose.transform_point(p).z;
+        let row = &mut rows[obs.point_idx];
+        if z <= 0.0 || z < depth_gate_bound(d, factor) {
+            row.0 = true;
+        } else {
+            row.1.push((o, d, obs.depth_sigma as f64));
+        }
+    }
+    let mut moved = 0;
+    for (j, (blocked, mut gated)) in rows.into_iter().enumerate() {
+        if blocked || !point_free[j] || gated.is_empty() {
+            continue;
+        }
+        // Best measured first; ties keep observation order.
+        gated.sort_by(|a, b| a.2.total_cmp(&b.2));
+        // The landmark moved along `o`'s ray to its measured depth `d`.
+        let candidate_of = |(o, d, _): GatedDepthRow| {
+            let pose = &keyframes[observations[o].pose_idx].pose;
+            let p_cam = pose.transform_point(&points[j]);
+            (
+                pose.inverse()
+                    .transform_point(&(p_cam * (d as f64 / p_cam.z))),
+                p_cam.z,
+            )
+        };
+        let corroborated = |(c, _, sigma): GatedDepthRow, candidate: &Vec3F64| {
+            gated
+                .iter()
+                .filter(|row| row.0 != c)
+                .any(|&(o, d_o, sigma_o)| {
+                    let z_o = keyframes[observations[o].pose_idx]
+                        .pose
+                        .transform_point(candidate)
+                        .z;
+                    let tolerance =
+                        RESEED_AGREEMENT_SIGMAS * (sigma * sigma + sigma_o * sigma_o).sqrt();
+                    (z_o - d_o as f64).abs() <= tolerance
+                })
+        };
+        // Each gated row in turn, so one bad best row cannot veto two rows
+        // that agree with each other; failing that, the best row alone if
+        // the landmark's depth is implausible.
+        let reseed = gated
+            .iter()
+            .find_map(|&row| {
+                let (candidate, _) = candidate_of(row);
+                corroborated(row, &candidate).then_some(candidate)
+            })
+            .or_else(|| {
+                let best = gated[0];
+                let (candidate, z) = candidate_of(best);
+                let bound = depth_gate_bound(best.1, factor);
+                (z > RESEED_UNCORROBORATED_FACTOR * bound).then_some(candidate)
+            });
+        if let Some(candidate) = reseed {
+            points[j] = candidate;
+            moved += 1;
+        }
+    }
+    moved
+}
+
+/// Whether each observation's stereo depth row enters the solve, and how many
+/// were gated (see [`ViBaParams::depth_gate_factor`]).
+fn depth_gate(
+    keyframes: &[ViBaKeyframe],
+    points: &[Vec3F64],
+    observations: &[BaObservation],
+    factor: f64,
+) -> (Vec<bool>, usize) {
+    let mut gated = 0;
+    let keep = observations
+        .iter()
+        .map(|obs| {
+            let Some(d) = obs.depth_meas else {
+                return false;
+            };
+            let (Some(kf), Some(p)) = (keyframes.get(obs.pose_idx), points.get(obs.point_idx))
+            else {
+                return false;
+            };
+            let z = kf.pose.transform_point(p).z;
+            let keep = z > 0.0 && z < depth_gate_bound(d, factor);
+            gated += usize::from(!keep);
+            keep
+        })
+        .collect();
+    (keep, gated)
+}
+
+/// Indices of the observations whose landmark is in front of the observing
+/// camera in `before` and not in `after` (camera depth `<= 0`).
+fn cheirality_flips(
+    observations: &[BaObservation],
+    before: (&[ViBaKeyframe], &[Vec3F64]),
+    after: (&[ViBaKeyframe], &[Vec3F64]),
+) -> Vec<usize> {
+    let depth = |(kfs, xyz): (&[ViBaKeyframe], &[Vec3F64]), obs: &BaObservation| {
+        kfs[obs.pose_idx]
+            .pose
+            .transform_point(&xyz[obs.point_idx])
+            .z
+    };
+    observations
+        .iter()
+        .enumerate()
+        .filter(|(_, obs)| obs.pose_idx < before.0.len() && obs.point_idx < before.1.len())
+        .filter(|(_, obs)| depth(before, obs) > 0.0 && depth(after, obs) <= 0.0)
+        .map(|(o, _)| o)
+        .collect()
+}
+
+/// What the cheirality check made of a trial step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CheiralityOutcome {
+    /// Free landmarks whose step was undone in the trial state.
+    points_held: usize,
+    /// Whether the step must be refused: after the holds, an observation
+    /// that is a Huber inlier at the linearization point still flips.
+    refuse: bool,
+}
+
+/// Keeps a trial step's landmarks in front of the cameras that observe them,
+/// one landmark at a time. A free landmark (`point_local >= 0`) with an
+/// observation that flips gets its old position back in `after_xyz`; a flip
+/// left after that comes from the camera motion and refuses the step only if
+/// that observation is a Huber inlier (`inlier`, per observation, at the
+/// linearization point). An outlier's flip is accepted: its reprojection is
+/// already Huber-bounded, and refusing it would stall the whole window on one
+/// mismatched association.
+fn enforce_cheirality(
+    observations: &[BaObservation],
+    inlier: &[bool],
+    point_local: &[i64],
+    before: (&[ViBaKeyframe], &[Vec3F64]),
+    after_kfs: &[ViBaKeyframe],
+    after_xyz: &mut [Vec3F64],
+) -> CheiralityOutcome {
+    let mut points_held = 0;
+    for o in cheirality_flips(observations, before, (after_kfs, after_xyz)) {
+        let j = observations[o].point_idx;
+        if point_local[j] >= 0 && after_xyz[j] != before.1[j] {
+            after_xyz[j] = before.1[j];
+            points_held += 1;
+        }
+    }
+    let refuse = cheirality_flips(observations, before, (after_kfs, after_xyz))
+        .into_iter()
+        .any(|o| inlier[o]);
+    CheiralityOutcome {
+        points_held,
+        refuse,
+    }
+}
+
+/// Marquardt-damps each 3×3 point block in place, `C + λ·diag(C)`, as the
+/// keyframe system is damped. A landmark seen from one viewpoint has a rank-2
+/// C (no curvature along its ray); undamped, its inverse sends the point step
+/// out along the ray by whatever round-off left there. Damping bounds the
+/// step, not the depth: λ falls to its floor on accepted steps, so a
+/// depth-free landmark still drifts along its ray across windows.
+fn damp_point_blocks(c_blocks: &mut [[f64; 9]], lambda: f64) {
+    for cb in c_blocks {
+        for d in 0..3 {
+            cb[d * 4] += lambda * cb[d * 4].max(MIN_DAMPING_FLOOR);
+        }
+    }
 }
 
 // ── Reprojection residual/Jacobian ────────────────────────────────────────
@@ -330,10 +641,13 @@ fn depth_residual_and_jacobian(
     let s21 = pz * r20 - px * r22;
     let s22 = -py * r20 + px * r21;
 
+    // Right perturbation `T · exp([ρ|ω])`: z = row 2 of `R (p_w + ρ + ω×p_w) + t`
+    // to first order, so the translation part is row 2 of R, the same row the
+    // point Jacobian takes (not `(0, 0, 1)`, which holds only for R = I).
     let j_pose = [
-        0.0,
-        0.0,
-        inv_sigma,
+        r20 * inv_sigma,
+        r21 * inv_sigma,
+        r22 * inv_sigma,
         s20 * inv_sigma,
         s21 * inv_sigma,
         s22 * inv_sigma,
@@ -528,9 +842,9 @@ fn accum_jt_omega_j(
         for c in 0..15 {
             let mut s = 0.0f64;
             for k in 0..15 {
-                s += omega[r * 15 + k] * j_b[k * 15 + c];
+                s += omega[idx15(r, k)] * j_b[idx15(k, c)];
             }
-            omega_jb[r * 15 + c] = s;
+            omega_jb[idx15(r, c)] = s;
         }
     }
 
@@ -539,7 +853,7 @@ fn accum_jt_omega_j(
         for j in 0..15 {
             let mut s = 0.0f64;
             for k in 0..15 {
-                s += j_a[k * 15 + i] * omega_jb[k * 15 + j];
+                s += j_a[idx15(k, i)] * omega_jb[idx15(k, j)];
             }
             m_mat[(row_base + i, col_base + j)] += s;
         }
@@ -550,41 +864,48 @@ fn accum_jt_omega_j(
         let mut omega_r = [0.0f64; 15];
         for k in 0..15 {
             for m in 0..15 {
-                omega_r[k] += omega[k * 15 + m] * res[m];
+                omega_r[k] += omega[idx15(k, m)] * res[m];
             }
         }
         for i in 0..15 {
             let mut s = 0.0f64;
             for k in 0..15 {
-                s += j_a[k * 15 + i] * omega_r[k];
+                s += j_a[idx15(k, i)] * omega_r[k];
             }
             m_vec[row_base + i] -= s;
         }
     }
 }
 
-/// Huber weight for one IMU edge based on the 9-dim nav residual's Mahalanobis distance.
-///
-/// chi2_nav = r_nav^T · Ω_nav · r_nav  (rows/cols 0–8 of the 15-dim system).
-/// Returns 1.0 when chi2_nav ≤ threshold (inlier), sqrt(threshold / chi2_nav) otherwise.
-/// The caller multiplies the full 15×15 omega by this weight before accumulating.
-fn huber_imu_weight(res: &[f64; 15], omega: &[f64; 225], chi2_threshold: f64) -> f64 {
-    // omega is 15×15 column-major: element (row r, col c) at index c*15+r.
-    let mut chi2 = 0.0f64;
-    for i in 0..9 {
-        for j in 0..9 {
-            chi2 += res[i] * omega[j * 15 + i] * res[j];
-        }
-    }
-    if chi2 <= chi2_threshold || chi2 < 1e-12 {
-        1.0
-    } else {
-        (chi2_threshold / chi2).sqrt()
-    }
+/// Row-major index of `(row, col)` in a 15×15 matrix stored as `[f64; 225]`
+/// (the IMU edge's information, Jacobians and products).
+#[inline]
+const fn idx15(row: usize, col: usize) -> usize {
+    row * 15 + col
 }
 
-fn visual_huber_weight(chi2: f64, chi2_threshold: f64) -> f64 {
-    HuberKernel.weight(chi2, chi2_threshold)
+/// Huber weight and cost of one IMU edge. The 9-dim nav block
+/// (rows/cols 0–8) is robustified on its Mahalanobis chi²; the bias random
+/// walk (9–14) stays quadratic. `omega_raw` is block-diagonal between the two
+/// (see [`imu_information_matrix`]) and symmetric. The caller scales only the
+/// nav block of omega by the returned weight.
+fn imu_weight_and_cost(res: &[f64; 15], omega_raw: &[f64; 225], chi2_threshold: f64) -> (f64, f64) {
+    let block_chi2 = |range: std::ops::Range<usize>| {
+        let mut chi2 = 0.0f64;
+        for i in range.clone() {
+            for j in range.clone() {
+                chi2 += res[i] * omega_raw[idx15(i, j)] * res[j];
+            }
+        }
+        chi2
+    };
+    let (hw, nav_cost) = huber_weight_and_cost(block_chi2(0..9), Some(chi2_threshold));
+    (hw, nav_cost + 0.5 * block_chi2(9..15))
+}
+
+/// Huber weight and cost `½ρ(chi2)` of a reprojection or depth residual.
+fn visual_huber(chi2: f64, chi2_threshold: f64) -> (f64, f64) {
+    huber_weight_and_cost(chi2, Some(chi2_threshold))
 }
 
 /// IMU edge information matrix: the full inverse of the 9×9 navigation
@@ -597,9 +918,10 @@ fn imu_information_matrix(pim: &PreintegratedImu, weight: f64) -> [f64; 225] {
     // rotation, velocity, and position errors (gyro drives all three; accel
     // drives velocity and position).
     if let Some(nav_inv) = invert_9x9_f64(&pim.covariance) {
-        for c in 0..9 {
-            for r in 0..9 {
-                omega[c * 15 + r] = weight * nav_inv[c * 9 + r];
+        for r in 0..9 {
+            for c in 0..9 {
+                // `nav_inv` is column-major, like the covariance it inverts.
+                omega[idx15(r, c)] = weight * nav_inv[c * 9 + r];
             }
         }
     } else {
@@ -619,14 +941,14 @@ fn imu_information_matrix(pim: &PreintegratedImu, weight: f64) -> [f64; 225] {
         }
         for i in 0..9 {
             let var = pim.covariance[i * 10]; // diagonal: col-major index i*9+i
-            omega[i * 15 + i] = weight * if var > 1e-20 { 1.0 / var } else { 1e6 };
+            omega[idx15(i, i)] = weight * if var > 1e-20 { 1.0 / var } else { 1e6 };
         }
     }
 
     // Bias random-walk block (6×6): uncorrelated, diagonal is exact.
     for i in 0..6 {
         let var = pim.bias_covariance[i * 7]; // diagonal: col-major index i*6+i
-        omega[(9 + i) * 15 + (9 + i)] = weight * if var > 1e-20 { 1.0 / var } else { 1e6 };
+        omega[idx15(9 + i, 9 + i)] = weight * if var > 1e-20 { 1.0 / var } else { 1e6 };
     }
     omega
 }
@@ -730,7 +1052,7 @@ fn set_block_15x15(m: &mut [f64; 225], row: usize, col: usize, block: &Mat3F64) 
     let cols = block.to_cols_array(); // column-major from glam
     for c in 0..3 {
         for r in 0..3 {
-            m[(row + r) * 15 + (col + c)] = cols[c * 3 + r];
+            m[idx15(row + r, col + c)] = cols[c * 3 + r];
         }
     }
 }
@@ -759,10 +1081,18 @@ fn wheel_information(edges: &[WheelOdomFactor], n_kf: usize) -> Result<Vec<Mat6>
             if edge.from_idx >= n_kf || edge.to_idx >= n_kf {
                 return Err(ViBaError::WheelFactorOutOfRange(edge.from_idx, edge.to_idx));
             }
+            // Its residual is a constant: nothing to constrain, so it is a
+            // caller error rather than a factor.
+            if edge.from_idx == edge.to_idx {
+                return Err(ViBaError::WheelFactorSelfLoop(k));
+            }
             // A NaN delta or extrinsic makes every cost NaN, so LM could
             // never accept a step; refuse it by name instead.
             if !(edge.extrinsics_finite() && edge.measurement.delta.iter().all(|v| v.is_finite())) {
                 return Err(ViBaError::NonFiniteWheelFactor(k));
+            }
+            if !edge.huber_valid() {
+                return Err(ViBaError::InvalidWheelHuber(k));
             }
             edge.measurement
                 .information()
@@ -1041,6 +1371,12 @@ pub fn visual_inertial_bundle_adjust(
 ) -> Result<ViBaResult, ViBaError> {
     const KF_DOF: usize = 15; // keyframe dimensions
 
+    // NaN would gate (and first re-seed) every depth row; 0 or less would
+    // gate every correct one. +inf is the documented "no upper bound".
+    if params.depth_gate_factor.is_nan() || params.depth_gate_factor <= 0.0 {
+        return Err(ViBaError::InvalidDepthGateFactor(params.depth_gate_factor));
+    }
+
     let n_kf = keyframes.len();
     let n_pts = points.len();
 
@@ -1122,10 +1458,27 @@ pub fn visual_inertial_bundle_adjust(
     // SE3F32 mirrors for the reprojection Jacobian (matches residual_and_jacobians).
     let mut se3s: Vec<SE3F32> = kfs.iter().map(|kf| pose_to_se3(&kf.pose)).collect();
 
+    let point_free: Vec<bool> = point_local.iter().map(|&j| j >= 0).collect();
+    let points_reseeded = reseed_walked_landmarks(
+        keyframes,
+        &mut xyz,
+        observations,
+        &point_free,
+        params.depth_gate_factor,
+    );
+    let (depth_on, depth_rows_gated) =
+        depth_gate(keyframes, &xyz, observations, params.depth_gate_factor);
+
     let mut lambda = params.initial_lambda;
     let mut iters_done = 0usize;
     let mut converged = false;
     let mut final_cost = f64::MAX;
+    let mut initial_cost = f64::MAX;
+    let mut cheirality_rejections = 0usize;
+    let mut cheirality_points_held = 0usize;
+    // Whether each observation's reprojection is a Huber inlier at the
+    // current linearization point (refreshed by every system build).
+    let mut vis_inlier = vec![false; observations.len()];
 
     for _iter in 0..params.max_iterations {
         iters_done += 1;
@@ -1150,7 +1503,12 @@ pub fn visual_inertial_bundle_adjust(
 
         let mut cost_vis = 0.0f64;
 
-        for obs in observations {
+        for ((obs, &depth_row), inlier) in observations
+            .iter()
+            .zip(&depth_on)
+            .zip(vis_inlier.iter_mut())
+        {
+            *inlier = false;
             if obs.pose_idx >= n_kf || obs.point_idx >= n_pts {
                 continue;
             }
@@ -1165,8 +1523,9 @@ pub fn visual_inertial_bundle_adjust(
             let jx_raw: [f64; 6] = std::array::from_fn(|i| jx_f32[i] as f64);
 
             let chi2_vis = r_raw[0] * r_raw[0] + r_raw[1] * r_raw[1];
-            let hw_vis = visual_huber_weight(chi2_vis, params.huber_reproj_px_sq);
-            cost_vis += 0.5 * hw_vis * chi2_vis;
+            *inlier = chi2_vis <= params.huber_reproj_px_sq;
+            let (hw_vis, c_vis) = visual_huber(chi2_vis, params.huber_reproj_px_sq);
+            cost_vis += c_vis;
             let sqrt_hw_vis = hw_vis.sqrt();
             let r = [r_raw[0] * sqrt_hw_vis, r_raw[1] * sqrt_hw_vis];
             let jp: [f64; 12] = std::array::from_fn(|i| jp_raw[i] * sqrt_hw_vis);
@@ -1218,13 +1577,13 @@ pub fn visual_inertial_bundle_adjust(
 
             // Depth residual (stereo metric anchor) — see
             // depth_residual_and_jacobian for why this matters here.
-            if let Some(d_meas) = obs.depth_meas {
+            if let Some(d_meas) = obs.depth_meas.filter(|_| depth_row) {
                 let sigma = (obs.depth_sigma as f64).max(1e-6);
                 let (r_z_raw, jpd_raw, jxd_raw) =
                     depth_residual_and_jacobian(pose, point, d_meas as f64, sigma);
                 let chi2_depth = r_z_raw * r_z_raw;
-                let hw_depth = visual_huber_weight(chi2_depth, params.huber_depth_sigma_sq);
-                cost_vis += 0.5 * hw_depth * chi2_depth;
+                let (hw_depth, c_depth) = visual_huber(chi2_depth, params.huber_depth_sigma_sq);
+                cost_vis += c_depth;
                 let sqrt_hw_depth = hw_depth.sqrt();
                 let r_z = r_z_raw * sqrt_hw_depth;
                 let jpd: [f64; 6] = std::array::from_fn(|i| jpd_raw[i] * sqrt_hw_depth);
@@ -1290,6 +1649,7 @@ pub fn visual_inertial_bundle_adjust(
         // Point back-substitution only needs the first 6 elements of each
         // keyframe's delta (pose DOF), so the B blocks are 6×3 as before.
 
+        damp_point_blocks(&mut c_blocks, lambda);
         let c_inv: Vec<Option<[f64; 9]>> = c_blocks.iter().map(invert_3x3_f64).collect();
 
         for (j, b_for_j) in b_by_point.iter().enumerate() {
@@ -1374,12 +1734,13 @@ pub fn visual_inertial_bundle_adjust(
             // distinct g2o edges). Scaling it by the *nav* residual's outlier-ness
             // was silencing the one thing meant to resist a bad nav window explaining
             // itself away through bias, in exactly the windows where that matters.
-            let hw = huber_imu_weight(&res, &omega_raw, params.huber_imu_chi2);
+            let (hw, c_imu) = imu_weight_and_cost(&res, &omega_raw, params.huber_imu_chi2);
+            cost_imu += c_imu;
             let omega: [f64; 225] = {
                 let mut o = omega_raw;
-                for c in 0..9 {
-                    for r in 0..9 {
-                        o[c * 15 + r] *= hw;
+                for r in 0..9 {
+                    for c in 0..9 {
+                        o[idx15(r, c)] *= hw;
                     }
                 }
                 o
@@ -1403,17 +1764,6 @@ pub fn visual_inertial_bundle_adjust(
                         Ω∈[{om_min:.2e},{om_max:.2e}]  hw={hw:.4}",
                     edge.preintegrated.dt,
                 );
-            }
-
-            // Cost: ½ rᵀ Ω r.
-            let mut omega_r = [0.0f64; 15];
-            for r in 0..15 {
-                for k in 0..15 {
-                    omega_r[r] += omega[r * 15 + k] * res[k];
-                }
-            }
-            for k in 0..15 {
-                cost_imu += 0.5 * res[k] * omega_r[k];
             }
 
             // Accumulate H_ii, g_i.
@@ -1483,7 +1833,11 @@ pub fn visual_inertial_bundle_adjust(
             &stationary_info,
         );
 
-        let cost = (cost_vis + cost_imu + cost_bias_prior + cost_wheel + cost_stationary) as f32;
+        let cost_f64 = cost_vis + cost_imu + cost_bias_prior + cost_wheel + cost_stationary;
+        if initial_cost == f64::MAX {
+            initial_cost = cost_f64;
+        }
+        let cost = cost_f64 as f32;
 
         // ── 4. LM damping on full 15P system, then Cholesky ──────────────
         // Damping goes on AFTER IMU terms so every diagonal entry sees it.
@@ -1502,7 +1856,6 @@ pub fn visual_inertial_bundle_adjust(
         // proportionate regardless of a DOF's native units; the floor
         // guards DOFs an untouched free keyframe leaves at exactly zero
         // (e.g. velocity/bias when it has no IMU edge in this window).
-        const MIN_DAMPING_FLOOR: f64 = 1e-6;
         for d in 0..dim {
             let diag = m_mat[(d, d)].max(MIN_DAMPING_FLOOR);
             m_mat[(d, d)] += lambda * diag;
@@ -1602,9 +1955,32 @@ pub fn visual_inertial_bundle_adjust(
             xyz_trial[i].z += dp[2];
         }
 
+        // A step that puts an observed landmark behind its camera is not a
+        // better fit, whatever the cost says: the projection clamps such a
+        // depth (MIN_Z), so the cost no longer describes it. Hold the
+        // landmarks whose own step does it; a step whose camera motion still
+        // does it to an inlier observation counts as a cost increase.
+        let cheirality = enforce_cheirality(
+            observations,
+            &vis_inlier,
+            &point_local,
+            (&kfs, &xyz),
+            &kfs_trial,
+            &mut xyz_trial,
+        );
+        cheirality_points_held += cheirality.points_held;
+        if cheirality.refuse {
+            cheirality_rejections += 1;
+            lambda *= 10.0;
+            if lambda > 1e10 {
+                break;
+            }
+            continue;
+        }
+
         // ── 7. Trial cost (visual + IMU) ─────────────────────────────────
         let mut new_cost_vis = 0.0f64;
-        for obs in observations {
+        for (obs, &depth_row) in observations.iter().zip(&depth_on) {
             if obs.pose_idx >= n_kf || obs.point_idx >= n_pts {
                 continue;
             }
@@ -1615,10 +1991,9 @@ pub fn visual_inertial_bundle_adjust(
                 camera,
             );
             let chi2_vis = (r_f32[0] * r_f32[0] + r_f32[1] * r_f32[1]) as f64;
-            let hw_vis = visual_huber_weight(chi2_vis, params.huber_reproj_px_sq);
-            new_cost_vis += 0.5 * hw_vis * chi2_vis;
+            new_cost_vis += visual_huber(chi2_vis, params.huber_reproj_px_sq).1;
 
-            if let Some(d_meas) = obs.depth_meas {
+            if let Some(d_meas) = obs.depth_meas.filter(|_| depth_row) {
                 let sigma = (obs.depth_sigma as f64).max(1e-6);
                 let (r_z, _, _) = depth_residual_and_jacobian(
                     &se3s_trial[obs.pose_idx],
@@ -1626,9 +2001,7 @@ pub fn visual_inertial_bundle_adjust(
                     d_meas as f64,
                     sigma,
                 );
-                let chi2_depth = r_z * r_z;
-                let hw_depth = visual_huber_weight(chi2_depth, params.huber_depth_sigma_sq);
-                new_cost_vis += 0.5 * hw_depth * chi2_depth;
+                new_cost_vis += visual_huber(r_z * r_z, params.huber_depth_sigma_sq).1;
             }
         }
         let mut new_cost_imu = 0.0f64;
@@ -1651,32 +2024,7 @@ pub fn visual_inertial_bundle_adjust(
                     *x *= params.boundary_imu_info_scale;
                 }
             }
-            let hw = huber_imu_weight(&res, &omega_raw, params.huber_imu_chi2);
-            // Mirrors the block-split in the main Hessian build: `hw` only applies to
-            // the nav 9×9 sub-block, the bias-random-walk 6×6 sub-block stays at full
-            // weight. Kept as separate accumulators since `omega_raw` is block-diagonal
-            // (no nav/bias cross terms — see `imu_information_matrix`).
-            let mut omega_r_nav = [0.0f64; 9];
-            for r in 0..9 {
-                for k in 0..9 {
-                    omega_r_nav[r] += omega_raw[r * 15 + k] * res[k];
-                }
-            }
-            let mut nav_cost = 0.0f64;
-            for k in 0..9 {
-                nav_cost += 0.5 * res[k] * omega_r_nav[k];
-            }
-            let mut omega_r_bias = [0.0f64; 6];
-            for r in 0..6 {
-                for k in 0..6 {
-                    omega_r_bias[r] += omega_raw[(9 + r) * 15 + (9 + k)] * res[9 + k];
-                }
-            }
-            let mut bias_cost = 0.0f64;
-            for k in 0..6 {
-                bias_cost += 0.5 * res[9 + k] * omega_r_bias[k];
-            }
-            new_cost_imu += hw * nav_cost + bias_cost;
+            new_cost_imu += imu_weight_and_cost(&res, &omega_raw, params.huber_imu_chi2).1;
         }
         let mut new_cost_bias_prior = 0.0f64;
         if params.accel_bias_prior_weight > 0.0 {
@@ -1777,20 +2125,158 @@ pub fn visual_inertial_bundle_adjust(
         iterations: iters_done,
         converged,
         final_cost,
+        initial_cost,
+        depth_rows_gated,
+        points_reseeded,
+        cheirality_rejections,
+        cheirality_points_held,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ViBaParams, visual_huber_weight};
+    use super::{ViBaParams, depth_residual_and_jacobian, imu_weight_and_cost, visual_huber};
+    use kornia_algebra::{SE3F32, SO3F32, SO3F64, Vec3AF32, Vec3F64};
+
+    /// The stereo depth row's analytic Jacobian matches central differences
+    /// of the predicted depth under the solver's right perturbation
+    /// `T · exp([ρ|ω])` (the convention of `SE3F32::retract`), for a rotated
+    /// camera. The reference is evaluated in f64 from the same rotation
+    /// entries, so the two agree to 1e-6.
+    ///
+    /// Red on the old code (2026-10-13): its translation part was
+    /// `(0, 0, 1/σ)`, right only for R = I; here row 2 of R is
+    /// `(0.673, 0.254, 0.695)`, so it is off by up to 0.67/σ.
+    #[test]
+    fn depth_jacobian_matches_numeric_differentiation() {
+        let r = SO3F32::exp(Vec3AF32::new(0.4, -0.7, 0.3));
+        let pose = SE3F32 {
+            r,
+            t: Vec3AF32::new(0.2, -0.1, 0.5),
+        };
+        let point = Vec3F64::new(0.8, -0.3, 3.1);
+        let (d_meas, sigma) = (2.5, 0.07);
+        let (r_z, j_pose, j_point) = depth_residual_and_jacobian(&pose, &point, d_meas, sigma);
+
+        let m = pose.r.matrix();
+        let rot: [[f64; 3]; 3] = std::array::from_fn(|i| {
+            let c = [m.col(0), m.col(1), m.col(2)];
+            std::array::from_fn(|j| [c[j].x, c[j].y, c[j].z][i] as f64)
+        });
+        let t = [pose.t.x as f64, pose.t.y as f64, pose.t.z as f64];
+        // Residual at `T · exp([ρ|ω])` and world point `p`, first-order exact
+        // in ρ (V(ω) = I + O(ω)).
+        let residual = |rho: [f64; 3], omega: [f64; 3], p: Vec3F64| {
+            let q = SO3F64::exp(Vec3F64::new(omega[0], omega[1], omega[2])).matrix() * p;
+            let local = [q.x + rho[0], q.y + rho[1], q.z + rho[2]];
+            let z: f64 = (0..3).map(|j| rot[2][j] * local[j]).sum::<f64>() + t[2];
+            (z - d_meas) / sigma
+        };
+        let z0 = residual([0.0; 3], [0.0; 3], point);
+        // r_z is computed in f32 for the point transform.
+        assert!((z0 - r_z).abs() < 1e-4, "{z0} vs {r_z}");
+
+        let h = 1e-6;
+        for k in 0..6 {
+            let (mut up, mut down) = ([0.0f64; 6], [0.0f64; 6]);
+            up[k] = h;
+            down[k] = -h;
+            let eval = |d: [f64; 6]| residual([d[0], d[1], d[2]], [d[3], d[4], d[5]], point);
+            let numeric = (eval(up) - eval(down)) / (2.0 * h);
+            assert!(
+                (numeric - j_pose[k]).abs() < 1e-6 * numeric.abs().max(1.0),
+                "pose column {k}: numeric {numeric} vs analytic {}",
+                j_pose[k]
+            );
+        }
+        for k in 0..3 {
+            let shifted = |dh: f64| {
+                let mut a = [point.x, point.y, point.z];
+                a[k] += dh;
+                Vec3F64::new(a[0], a[1], a[2])
+            };
+            let (up, down) = (shifted(h), shifted(-h));
+            let numeric =
+                (residual([0.0; 3], [0.0; 3], up) - residual([0.0; 3], [0.0; 3], down)) / (2.0 * h);
+            assert!(
+                (numeric - j_point[k]).abs() < 1e-6 * numeric.abs().max(1.0),
+                "point column {k}: numeric {numeric} vs analytic {}",
+                j_point[k]
+            );
+        }
+
+        // The reference perturbs the way the solver's retraction does: a
+        // coarse f32 step through `SE3F32::retract` moves the depth by J·δ.
+        for k in 0..6 {
+            let mut delta = [0.0f32; 6];
+            delta[k] = 1e-2;
+            let moved = depth_residual_and_jacobian(&pose.retract(&delta), &point, d_meas, sigma).0;
+            let predicted = r_z + j_pose[k] * 1e-2;
+            assert!(
+                (moved - predicted).abs() < 2e-3 * (1.0 / sigma),
+                "retract column {k}: {moved} vs {predicted}"
+            );
+        }
+    }
+
+    /// The IMU edge's cost (used by both the system build and the trial
+    /// step) has the gradient the normal equations use: `w Ω r` on the
+    /// Huber-robustified nav rows 0-8, `Ω r` on the quadratic bias rows
+    /// 9-14, inside and past `huber_imu_chi2`.
+    ///
+    /// Red (2026-10-13, mutated in place) with the old `½ w chi²` nav cost,
+    /// and with the bias block taken over rows 8-14.
+    #[test]
+    fn imu_cost_gradient_is_the_weighted_gradient() {
+        // Block-diagonal SPD omega: a coupled nav block, a diagonal bias block.
+        let mut omega = [0.0f64; 225];
+        for i in 0..9 {
+            for j in 0..9 {
+                omega[i * 15 + j] = if i == j {
+                    4.0 + i as f64
+                } else {
+                    0.3 / (1.0 + (i as f64 - j as f64).abs())
+                };
+            }
+        }
+        for i in 9..15 {
+            omega[i * 15 + i] = 50.0 + 10.0 * i as f64;
+        }
+        let k = ViBaParams::default().huber_imu_chi2;
+        for scale in [0.05, 3.0] {
+            let res: [f64; 15] = std::array::from_fn(|i| {
+                scale * (0.4 + 0.1 * i as f64) * if i % 2 == 0 { 1.0 } else { -1.0 }
+            });
+            let (w, _) = imu_weight_and_cost(&res, &omega, k);
+            assert!(
+                if scale > 1.0 { w < 1.0 } else { w == 1.0 },
+                "{scale}: w = {w}"
+            );
+            for d in 0..15 {
+                let h = 1e-6;
+                let (mut up, mut down) = (res, res);
+                up[d] += h;
+                down[d] -= h;
+                let numeric = (imu_weight_and_cost(&up, &omega, k).1
+                    - imu_weight_and_cost(&down, &omega, k).1)
+                    / (2.0 * h);
+                let omega_r: f64 = (0..15).map(|m| omega[d * 15 + m] * res[m]).sum();
+                let analytic = if d < 9 { w * omega_r } else { omega_r };
+                assert!(
+                    (numeric - analytic).abs() <= 1e-5 * analytic.abs().max(1.0),
+                    "scale {scale}, row {d}: {numeric} vs {analytic}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn visual_huber_defaults_and_weights() {
         let params = ViBaParams::default();
         assert_eq!(params.huber_reproj_px_sq, 25.0);
         assert_eq!(params.huber_depth_sigma_sq, 9.0);
-        assert_eq!(visual_huber_weight(4.0, 25.0), 1.0);
-        assert_eq!(visual_huber_weight(100.0, 25.0), 0.5);
+        assert_eq!(visual_huber(4.0, 25.0), (1.0, 2.0));
+        assert_eq!(visual_huber(100.0, 25.0), (0.5, 37.5));
     }
 }
 
@@ -1801,3 +2287,7 @@ mod wheel_tests;
 #[cfg(test)]
 #[path = "vi_ba_stationary_tests.rs"]
 mod stationary_tests;
+
+#[cfg(test)]
+#[path = "vi_ba_flung_landmark_tests.rs"]
+mod flung_landmark_tests;
